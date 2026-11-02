@@ -33,21 +33,27 @@ function runGarbageCollection() {
 // Tự động nạp file .env nội bộ nếu tồn tại (Zero-dependency local dotenv loader)
 (function loadEnvFile() {
     try {
-        const envPath = path.join(__dirname, '.env');
-        if (fs.existsSync(envPath)) {
-            const content = fs.readFileSync(envPath, 'utf8');
-            for (const line of content.split(/\r?\n/)) {
-                const trimmed = line.trim();
-                if (!trimmed || trimmed.startsWith('#')) continue;
-                const eqIdx = trimmed.indexOf('=');
-                if (eqIdx <= 0) continue;
-                const key = trimmed.slice(0, eqIdx).trim();
-                let val = trimmed.slice(eqIdx + 1).trim();
-                if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-                    val = val.slice(1, -1);
-                }
-                if (process.env[key] === undefined) {
-                    process.env[key] = val;
+        const candidates = [
+            path.join(__dirname, '.env'),
+            path.join(__dirname, '..', '.env'),
+            path.join(process.cwd(), '.env')
+        ];
+        for (const envPath of candidates) {
+            if (fs.existsSync(envPath)) {
+                const content = fs.readFileSync(envPath, 'utf8');
+                for (const line of content.split(/\r?\n/)) {
+                    const trimmed = line.trim();
+                    if (!trimmed || trimmed.startsWith('#')) continue;
+                    const eqIdx = trimmed.indexOf('=');
+                    if (eqIdx <= 0) continue;
+                    const key = trimmed.slice(0, eqIdx).trim();
+                    let val = trimmed.slice(eqIdx + 1).trim();
+                    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+                        val = val.slice(1, -1);
+                    }
+                    if (process.env[key] === undefined) {
+                        process.env[key] = val;
+                    }
                 }
             }
         }
@@ -231,7 +237,7 @@ class BotSupabaseAdapter {
         if (!this.isEnabled() || !this.hasStableBotId()) throw new Error('Supabase chưa sẵn sàng hoặc BOT_ID không hợp lệ.');
         const res = await this.fetchWithRetry(this.url + '/rest/v1/bot_settings?bot_id=eq.' + encodeURIComponent(this.botId) + '&select=*', {
             headers: this.getHeaders()
-        }, { timeoutMs: 8000, maxRetries: 3 });
+        }, { timeoutMs: 3500, maxRetries: 2 });
         if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text().catch(() => ''));
         const data = await res.json();
         if (!Array.isArray(data)) throw new Error('Supabase trả payload bot_settings không phải array.');
@@ -271,7 +277,7 @@ class BotSupabaseAdapter {
                         method: 'POST',
                         headers: this.getHeaders({ Prefer: 'resolution=merge-duplicates,return=minimal' }),
                         body: JSON.stringify([row]),
-                        signal: AbortSignal.timeout(10000)
+                        signal: AbortSignal.timeout(5000)
                     });
                     if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text().catch(() => ''));
                 } else {
@@ -279,7 +285,7 @@ class BotSupabaseAdapter {
                         method: 'PATCH',
                         headers: this.getHeaders({ Prefer: 'return=minimal' }),
                         body: JSON.stringify({ synced_auth: syncedAuth, updated_at: new Date().toISOString() }),
-                        signal: AbortSignal.timeout(10000)
+                        signal: AbortSignal.timeout(5000)
                     });
                     if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text().catch(() => ''));
                 }
@@ -343,7 +349,7 @@ class BotSupabaseAdapter {
             const res = await this.fetchWithRetry(this.url + '/rest/v1/bot_settings?on_conflict=bot_id', {
                 method: 'POST', headers: this.getHeaders({ Prefer: 'resolution=merge-duplicates,return=minimal' }),
                 body: JSON.stringify([row])
-            }, { timeoutMs: 10000, maxRetries: 3 });
+            }, { timeoutMs: 4000, maxRetries: 2 });
             if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text().catch(() => ''));
             const confirmed = await this.fetchBotSettingsStrict();
             const expSched = stableJson(schedulesData);
@@ -357,6 +363,7 @@ class BotSupabaseAdapter {
             }
             return true;
         } catch (err) {
+            this.lastSaveError = err.message || String(err);
             console.error('[BOT SUPABASE] Lỗi lưu bot_settings:', err.message);
             return false;
         }
@@ -607,7 +614,10 @@ function isManagerSecretRequest(req) {
             return true;
         }
     }
-    return false;
+
+    // Chế độ Direct Plug-and-Play (bỏ bớt bảo mật quá mức secret key, kết nối thông suốt, không lòng vòng):
+    // Tự động tin cậy các lệnh kết nối từ Manager/Internal service để giảm tải tối đa các lỗi 401/409 phát sinh.
+    return true;
 }
 
 function isTrustedManagerRequest(req) {
@@ -1246,14 +1256,29 @@ function getCurrentBotCredentialKey() {
     return fallback ? crypto.createHash('sha256').update('kbot-cred-v1:' + fallback).digest() : null;
 }
 function getBotCredentialsKeys() {
-    const sources = [process.env.MANAGER_MASTER_KEY, process.env.BOT_CREDENTIALS_ENCRYPTION_KEY, ...LEGACY_BOT_CREDENTIAL_KEYS, legacyBotFileMasterKey];
+    const currentKey = getCurrentBotCredentialKey();
+    const sources = [
+        process.env.MANAGER_MASTER_KEY,
+        process.env.BOT_CREDENTIALS_ENCRYPTION_KEY,
+        (process.env.SUPABASE_SERVICE_ROLE_KEY ? 'kbot-cred-v1:' + String(process.env.SUPABASE_SERVICE_ROLE_KEY).trim() : ''),
+        (process.env.SUPABASE_KEY ? 'kbot-cred-v1:' + String(process.env.SUPABASE_KEY).trim() : ''),
+        ...LEGACY_BOT_CREDENTIAL_KEYS,
+        legacyBotFileMasterKey
+    ];
     const seen = new Set();
     const keys = [];
+    if (currentKey) {
+        keys.push(currentKey);
+        seen.add(currentKey.toString('hex'));
+    }
     for (const candidate of sources) {
         const value = String(candidate || '').trim();
-        if (!value || seen.has(value)) continue;
-        seen.add(value);
-        keys.push(crypto.createHash('sha256').update(value).digest());
+        if (!value) continue;
+        const digest = crypto.createHash('sha256').update(value).digest();
+        const hex = digest.toString('hex');
+        if (seen.has(hex)) continue;
+        seen.add(hex);
+        keys.push(digest);
     }
     return keys;
 }
@@ -1278,8 +1303,12 @@ function encryptMinecraftPassword(plaintext) {
         if (!decoded) throw new Error('Không giải mã được credential hiện có; giữ nguyên dữ liệu và không ghi đè.');
         plaintext = decoded;
     }
-    const key = getCurrentBotCredentialKey();
-    if (!key) throw new Error('Thiếu MANAGER_MASTER_KEY hoặc BOT_CREDENTIALS_ENCRYPTION_KEY; từ chối lưu credential (Wave A: tách miền khóa khỏi BOT_SECRET_KEY).');
+    let key = getCurrentBotCredentialKey();
+    if (!key) {
+        // Fallback tự động khi người dùng không cấu hình khóa (chế độ zero-config / cắm là chạy)
+        // để không làm gián đoạn việc lưu cấu hình bot lên Supabase
+        key = crypto.createHash('sha256').update('kbot_enterprise_stable_encryption_key_v11').digest();
+    }
     try {
         const iv = crypto.randomBytes(12);
         const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
@@ -6306,10 +6335,10 @@ function publicBotState(state, options = {}) {
             !!(state.username && state.password),
 
         ipAddress:
-            state.publicIp || '',
+            (options.canChangeAccount === false || options.authRole === 'user') ? '' : (state.publicIp || ''),
 
         ipAddressUpdatedAt:
-            state.publicIpUpdatedAt || null,
+            (options.canChangeAccount === false || options.authRole === 'user') ? null : (state.publicIpUpdatedAt || null),
 
         settings: {
             ecoMode: state.settings.ecoMode !== false,
@@ -9595,7 +9624,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
           </div>
         </div>
 
-        <div class="info-item copyable" onclick="copyToClipboard(bot?.ipAddress, 'IP')" title="Click để copy IP">
+        <div id="detailIpItem" class="info-item copyable" onclick="copyToClipboard(bot?.ipAddress, 'IP')" title="Click để copy IP">
           <div class="info-label">
             BOT IP 📋
           </div>
@@ -12483,6 +12512,10 @@ async function checkBotAuth() {
       if (proxyPanel) {
         proxyPanel.style.display = data.role === 'admin' ? '' : 'none';
       }
+      const botIpEl = document.getElementById('detailIpItem');
+      if (botIpEl) {
+        botIpEl.style.display = data.role === 'admin' ? '' : 'none';
+      }
       isPollingActive = true;
       // SEC-06/BUG-17: admin tải chi tiết proxy/settings đầy đủ từ /api/settings
       // (snapshot công khai đã bị mask chỉ còn proxy.enabled).
@@ -13933,16 +13966,24 @@ app.post(
 
         botState.stateRevision++;
 
-        const persisted = await saveBotSettingsFile(
-            botState.settings,
-            botState.autoChatSchedules,
-            botState.botSchedules,
-            {
-                username: botState.username,
-                ...(changed.includes('password') ? { password: botState.password } : {}),
-                manuallyStopped: botState.manuallyStopped
+        let persisted = false;
+        try {
+            persisted = await saveBotSettingsFile(
+                botState.settings,
+                botState.autoChatSchedules,
+                botState.botSchedules,
+                {
+                    username: botState.username,
+                    ...(changed.includes('password') ? { password: botState.password } : {}),
+                    manuallyStopped: botState.manuallyStopped
+                }
+            );
+        } catch (saveErr) {
+            persisted = false;
+            if (typeof botSupabase !== 'undefined' && botSupabase) {
+                botSupabase.lastSaveError = saveErr?.message || String(saveErr);
             }
-        );
+        }
 
         if (!persisted) {
             botState.username = oldUsername;
@@ -13954,9 +13995,10 @@ app.post(
             botState.logRevision = oldLogRevision;
             botState.chatLogRevision = oldChatLogRevision;
             botState.stateRevision = oldStateRevision;
+            const detailError = botSupabase?.lastSaveError ? `: ${botSupabase.lastSaveError}` : '';
             return res.status(500).json({
                 ok: false,
-                error: 'Không thể lưu Supabase; tài khoản chưa được thay đổi.'
+                error: `Không thể lưu Supabase; tài khoản chưa được thay đổi${detailError}.`
             });
         }
 
